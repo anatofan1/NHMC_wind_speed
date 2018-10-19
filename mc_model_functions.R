@@ -1,0 +1,226 @@
+read_data <- function(data_file) {
+  wind_speed <- read_csv(data_file, 
+                         col_names = FALSE, na = "NA", comment = "#")
+  colnames(wind_speed) <- c("station", "lat", "lon", "elevation", "year", 
+                            "month", "day", "hour", "wind_speed_avg")
+  wind_speed <- wind_speed[-ncol(wind_speed)]
+  # Cleaning up data
+  wind_speed$hour <- wind_speed$hour/100
+  wind_speed
+}
+
+# this functions filters only the observations corresponding
+# to the crosby site
+prepare_crosby_df <- function(wind_data) {
+  crosby_data <- wind_data %>%
+    dplyr::filter(station == "Crosby")
+  
+  # clean up the outliers
+  # assign the value of the previous hour for it
+  outlier_index <- which(crosby_data$wind_speed_avg == 0)
+  crosby_data$wind_speed_avg[outlier_index] <- crosby_data$wind_speed_avg[outlier_index-1]
+  crosby_data
+}
+
+
+# this functions saves computational time while cacheing 
+# the results of seasonal partitioning procedure
+configure_function_cache <- function(cache_dir, cache_name) {
+  cache_location <- rflow::cache_file(cache_dir = cache_dir)
+  crosby_cache_eddy <- rflow::new_eddy(cache_name, cache = cache_location)
+  crosby_cache_eddy
+}
+
+
+# this functions generates partitions of the dataset 
+# in order to lessen the seasonal impact
+perform_fisher_partitioning <- function(sample, n_segments) {
+  my_dlc_result <- OHPL::dlc(sample, n_segments)
+  fop_dlc_crosby <- OHPL::FOP(sample, n_segments, my_dlc_result$C)
+  fop_dlc_crosby
+}
+
+
+adjust_seasonal_impact <- function(wind_data) {
+  # calculate annual mean
+  annual_mean <- mean(wind_data$wind_speed_avg)
+  
+  # calculate seasonal index for each seasonal segment
+  seasonal_means_data <- wind_data %>%
+    dplyr::group_by(seasonal_segment) %>%
+    dplyr::summarise(seasonal_mean = mean(wind_speed_avg)) %>%
+    dplyr::mutate(seasonal_index = seasonal_mean/annual_mean) 
+  
+  # join the obtained results to the initial wind data
+  wind_data <- seasonal_means_data %>%
+    dplyr::left_join(wind_data)
+  
+  # lessen seasonal impact by dividing acutual wind_speed values to seasonal index
+  adjusted_wind_data <- wind_data %>%
+    dplyr::mutate(adj_wind_speed_avg = round(wind_speed_avg/seasonal_index, 0))
+  
+  adjusted_wind_data
+}
+
+
+readjust_seasonal_impact <- function(wind_data) {
+  # calculate annual mean
+  annual_mean <- mean(wind_data$wind_speed_avg)
+  
+  # calculate seasonal index for each seasonal segment
+  seasonal_means_data <- wind_data %>%
+    dplyr::group_by(seasonal_segment) %>%
+    dplyr::summarise(seasonal_mean = mean(wind_speed_avg)) %>%
+    dplyr::mutate(seasonal_index = seasonal_mean/annual_mean) 
+  
+  # join the obtained results to the initial wind data
+  wind_data <- seasonal_means_data %>%
+    dplyr::left_join(wind_data)
+  
+  # lessen seasonal impact by dividing acutual wind_speed values to seasonal index
+  adjusted_wind_data <- wind_data %>%
+    dplyr::mutate(nhmc_estimates = nhmc_estimates * seasonal_index)
+  
+  adjusted_wind_data
+}
+
+
+generate_contingency_table <- function(crosby_data) {
+  # Generate transition matrix for NHMC using adj_wind_speed_avg and hour columns
+  contingency_crosby <- with(adj_crosby_data, table(adj_wind_speed_avg, hour))
+  contingency_crosby <- as.matrix(contingency_crosby)
+  contingency_crosby
+}
+
+
+generate_transition_matrix <- function(adj_crosby_data) {
+  contingency_crosby <- generate_contingency_table(adj_crosby_data)
+  wind_speed_total <- rowSums(contingency_crosby)
+  
+  transition_matrix <- matrix(0, nrow = nrow(contingency_crosby), ncol = nrow(contingency_crosby))
+  for (i in 1:nrow(contingency_crosby)) {
+    for(j in 1:ncol(contingency_crosby)) {
+      transition_matrix[i, j] <- contingency_crosby[i, j]/wind_speed_total[i]
+    }
+  }
+  transition_matrix
+}
+
+
+create_markov_model <- function(adj_crosby_data) {
+  crosby_nhmc_matrix <- create_nhmc_matrix(adj_crosby_data)
+  crosby_wind_markov <- markovchain::markovchainListFit(crosby_nhmc_matrix)
+  crosby_wind_markov
+}
+
+create_transition_matrix_list <- function(crosby_nhmc_matrix) {
+  ind <- split(1:(24*366), rep(1:24, 366))
+  ind[[1]] <- ind[[1]][-1]
+  
+  trans_ls <- list()
+  for (i in 2:(ncol(crosby_nhmc_matrix) + 1)) {
+    newdata <- matrix(crosby_nhmc_matrix[rep(1:24, 366) == i-1 | rep(1:24, 366) == i],
+                      ncol = 2, byrow = TRUE)
+    sum(apply(newdata, 1, function(x) x[1] == i-1 & x[2] == i))
+    
+    N <- sapply(ind, function(x, data) {sum((data[x-1] == i-1)*(data[x] == i))}, data = crosby_nhmc_matrix[-1])
+    Ntot <- sapply(ind, function(x, data){ sum((data[x-1] == i-1))}, data = crosby_nhmc_matrix[-1])
+    P <- N/Ntot
+    trans_ls[[i]] <- P
+  }
+  trans_ls
+}
+
+
+list_transition_matrices <- function(markov_model) {
+  trans_ls <- list()
+  for(i in 1:23) {
+    trans_mat <- markov_model$estimate@markovchains[[i]]@transitionMatrix
+    trans_ls[[i]] <- trans_mat
+  }
+  trans_ls
+}
+
+
+perform_homogeneity_test <- function(trans_matrix_list) {
+  verifyHomogeneity(trans_matrix_list)
+}
+
+calculate_probability_distribution <- function(wind_values) {
+  wind_value_frequencies <- as.data.frame(table(wind_values))
+  total_records <- length(wind_values)
+  wind_value_frequencies$probability <- wind_value_frequencies$Freq/total_records
+  wind_value_frequencies
+}
+
+
+calculate_frequency_matrix <- function(adj_crosby_data) {
+  freqMatrixes <- list()
+  data <- create_nhmc_matrix(adj_crosby_data)
+  nCols <- ncol(data)
+  freqMatrixes <- lapply(seq_len(nCols - 1), function(i) {
+    matrData <- data[, c(i, i + 1)]
+    matrData[1, ] <- as.character(matrData[1, ])
+    validTransition <- any(apply(matrData, 1, function(x) {
+      !any(is.na(x))
+    }))
+    if (validTransition) 
+      createSequenceMatrix(matrData, toRowProbs = FALSE, 
+                           sanitize = TRUE)
+    
+  })
+  freqMatrixes <- freqMatrixes[!sapply(freqMatrixes, is.null)]
+}
+
+
+create_nhmc_matrix <- function(adj_crosby_data) {
+  crosby_nhmc_matrix <- matrix(0, ncol = 25, nrow = nrow(adj_crosby_data)/24)
+  
+  # column names corresponding to the 24 hour cyclic period
+  colnames(crosby_nhmc_matrix) <- as.factor(0:24)
+  for (i in 0:(nrow(crosby_nhmc_matrix) - 1)) {
+    for(j in 2:25) {
+      crosby_nhmc_matrix[i+1, j] <- adj_crosby_data$adj_wind_speed_avg[(i* 24) + j-1]
+    } 
+  }
+  crosby_nhmc_matrix[2:nrow(crosby_nhmc_matrix), 1] <- crosby_nhmc_matrix[1:(nrow(crosby_nhmc_matrix)-1), ncol(crosby_nhmc_matrix)]
+  crosby_nhmc_matrix[1, 1] <- crosby_nhmc_matrix[1, ncol(crosby_nhmc_matrix)]
+  crosby_nhmc_matrix
+}
+
+
+
+create_nhmc_model <- function(adj_crosby_data) {
+  freqMatrixes <- calculate_frequency_matrix(adj_crosby_data)
+  freqMatrixes <- lapply(freqMatrixes, function(freqMatrix){
+    rSums <- rowSums(freqMatrix)
+    tMatrix <- freqMatrix/rSums
+    tMatrix
+  })
+  freqMatrixes
+}
+
+create_markov_chain_object <- function(markov_transition_matrices) {
+  for(i in 1:length(markov_transition_matrices)) {
+    markov_transition_matrices[[i]] <- new(
+      "markovchain", states = rownames(markov_transition_matrices[[i]]), 
+      transitionMatrix = markov_transition_matrices[[i]])
+  }
+  markov_transition_matrices <- new("markovchainList", markovchains = markov_transition_matrices)
+  markov_transition_matrices
+}
+
+# functions that calculates cumulative transition probability matrices
+# by adding the transition probabilities of each row
+calculate_cumulative_trans_matr <- function(probability_matrix_list) {
+  list_cumulative_matrices <- list()
+  for(l in 1:length(probability_matrix_list)) {
+   list_cumulative_matrices[[l]] <- colSums(probability_matrix_list[[l]]) 
+  }
+  list_cumulative_matrices
+}
+
+
+generate_one_day_estimation <- function(starting_time, initial_state, transition_lst) {
+  initial_distribution <- transition_lst[[starting_time]][initial_state, ]
+}
