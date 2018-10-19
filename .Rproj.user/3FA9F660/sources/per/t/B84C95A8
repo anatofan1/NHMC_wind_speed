@@ -1,0 +1,22 @@
+{
+    "collab_server" : "",
+    "contents" : "",
+    "created" : 1539961201049.000,
+    "dirty" : false,
+    "encoding" : "UTF-8",
+    "folds" : "",
+    "hash" : "1876893134",
+    "id" : "B84C95A8",
+    "lastKnownWriteTime" : 1539886377,
+    "last_content_update" : 1539886377,
+    "path" : "~/NHMC_wind_speed/main.R",
+    "project_path" : "main.R",
+    "properties" : {
+        "cursorPosition" : "19,0",
+        "scrollLine" : "0"
+    },
+    "relative_order" : 3,
+    "source_on_save" : false,
+    "source_window" : "",
+    "type" : "r_source"
+}

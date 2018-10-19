@@ -1,0 +1,9 @@
+{
+    "path" : "~/NHMC_wind_speed",
+    "sortOrder" : [
+        {
+            "ascending" : true,
+            "columnIndex" : 2
+        }
+    ]
+}
